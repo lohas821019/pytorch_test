@@ -1,3 +1,6 @@
 *.gz
 
 mnist/
+example/
+*.pth
+*.pt
