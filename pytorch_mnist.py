@@ -1,147 +1,182 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jul  6 15:31:02 2022
+Created on Thu Jul  7 11:08:17 2022
 
 @author: Jason
+
+https://nextjournal.com/gkoehler/pytorch-mnist#continued-training-from-checkpoints
 """
 
 import torch
-import torch.nn as nn
-from torch.autograd import Variable
-import torch.utils.data as Data
 import torchvision
+
+n_epochs = 3
+batch_size_train = 64
+batch_size_test = 1000
+learning_rate = 0.01
+momentum = 0.5
+log_interval = 10
+
+random_seed = 1
+torch.backends.cudnn.enabled = False
+
+#生成随机数 https://www.zhihu.com/question/288350769
+torch.manual_seed(random_seed)
+
+
+train_loader = torch.utils.data.DataLoader(
+  torchvision.datasets.MNIST('/files/', train=True, download=True,
+                             transform=torchvision.transforms.Compose([
+                               torchvision.transforms.ToTensor(),
+                               torchvision.transforms.Normalize(
+                                 (0.1307,), (0.3081,))
+                             ])),
+  batch_size=batch_size_train, shuffle=True)
+
+test_loader = torch.utils.data.DataLoader(
+  torchvision.datasets.MNIST('/files/', train=False, download=True,
+                             transform=torchvision.transforms.Compose([
+                               torchvision.transforms.ToTensor(),
+                               torchvision.transforms.Normalize(
+                                 (0.1307,), (0.3081,))
+                             ])),
+  batch_size=batch_size_test, shuffle=True)
+
+examples = enumerate(test_loader)
+batch_idx, (example_data, example_targets) = next(examples)
+
+example_data.shape
+
 import matplotlib.pyplot as plt
 
-if_use_gpu = 1            #使用gpu
+fig = plt.figure()
+for i in range(6):
+  plt.subplot(2,3,i+1)
+  plt.tight_layout()
+  plt.imshow(example_data[i][0], cmap='gray', interpolation='none')
+  plt.title("Ground Truth: {}".format(example_targets[i]))
+  plt.xticks([])
+  plt.yticks([])
+  
+#%% model架構
 
-#%%
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
-class CNN(nn.Module):
+class Net(nn.Module):
     def __init__(self):
-        super(CNN, self).__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(           
-                in_channels=1,  
-                out_channels=16, 
-                kernel_size=5,   
-                stride=1,        
-                padding=2),
-            nn.ReLU(),nn.MaxPool2d(kernel_size = 2))
-        #以上為一層conv + ReLu + maxpool
-        
-        #快速寫法：
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16,32,5,1,2),  #(32,14,14)
-            nn.ReLU(), 
-            nn.MaxPool2d(2)   #(32,7,7)
-        )
-        
-        self.out = nn.Linear(32*7*7, 10) #10=0~9
-       
-    def forward(self,x):
-       x = self.conv1(x)
-       x = self.conv2(x)
-       x = x.view(x.size(0), -1)
-       output = self.out(x)
-       return output
-       
-model = CNN()
-if if_use_gpu:
-    model = model.cuda()
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
+        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(320, 50)
+        self.fc2 = nn.Linear(50, 10)
+
+    def forward(self, x):
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, training=self.training)
+        x = self.fc2(x)
+        return F.log_softmax(x)
+
+network = Net()
+optimizer = optim.SGD(network.parameters(), lr=learning_rate,momentum=momentum)
 
 #%%
 
-train_data_set = torchvision.datasets.MNIST(
-    root='./mnist',
-    train=True,
-    transform=torchvision.transforms.ToTensor(), 
-    #把灰階從0~255壓縮到0~1
-    download= False
-)
-
-#看size
-print(train_data_set.train_data.size())
-print(train_data_set.train_labels.size())
+train_losses = []
+train_counter = []
+test_losses = []
+test_counter = [i*len(train_loader.dataset) for i in range(n_epochs + 1)]
 
 
-BATCH_SIZE = 50 
+def train(epoch):
+  network.train()
+  for batch_idx, (data, target) in enumerate(train_loader):
+    optimizer.zero_grad()
+    output = network(data)
+    loss = F.nll_loss(output, target)
+    loss.backward()
+    optimizer.step()
+    if batch_idx % log_interval == 0:
+      print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+        epoch, batch_idx * len(data), len(train_loader.dataset),
+        100. * batch_idx / len(train_loader), loss.item()))
+      train_losses.append(loss.item())
+      train_counter.append(
+        (batch_idx*64) + ((epoch-1)*len(train_loader.dataset)))
+      torch.save(network.state_dict(), './results/model.pth')
+      torch.save(optimizer.state_dict(), './results/optimizer.pth')
 
-train_loader = Data.DataLoader(dataset = train_data_set, batch_size = BATCH_SIZE, shuffle=True)
-#shuffle是隨機從data裡讀去資料.
 
-test_data_set = torchvision.datasets.MNIST(
-    root='./mnist/', 
-    train=False,
-    transform=torchvision.transforms.ToTensor(),
-    download=False,
-    )
+def test():
+  network.eval()
+  test_loss = 0
+  correct = 0
+  with torch.no_grad():
+    for data, target in test_loader:
+      output = network(data)
+      test_loss += F.nll_loss(output, target, size_average=False).item()
+      pred = output.data.max(1, keepdim=True)[1]
+      correct += pred.eq(target.data.view_as(pred)).sum()
+  test_loss /= len(test_loader.dataset)
+  test_losses.append(test_loss)
+  print('\nTest set: Avg. loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    test_loss, correct, len(test_loader.dataset),
+    100. * correct / len(test_loader.dataset)))
 
-test_x = Variable(torch.unsqueeze(test_data_set.test_data, dim=1).float(), requires_grad=False)
-#requires_grad=False 不參與反向傳播,test data 不用做
-test_y = test_data_set.test_labels
+
+test()
+for epoch in range(1, n_epochs + 1):
+  train(epoch)
+  test()
+
+fig = plt.figure()
+plt.plot(train_counter, train_losses, color='blue')
+plt.scatter(test_counter, test_losses, color='red')
+plt.legend(['Train Loss', 'Test Loss'], loc='upper right')
+plt.xlabel('number of training examples seen')
+plt.ylabel('negative log likelihood loss')
 
 
 #%%
 
-LR =0.001
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-loss_function = nn.CrossEntropyLoss()
+with torch.no_grad():
+  output = network(example_data)
+  
+fig = plt.figure()
+for i in range(6):
+  plt.subplot(2,3,i+1)
+  plt.tight_layout()
+  plt.imshow(example_data[i][0], cmap='gray', interpolation='none')
+  plt.title("Prediction: {}".format(
+    output.data.max(1, keepdim=True)[1][i].item()))
+  plt.xticks([])
+  plt.yticks([])
 
-EPOCH = 10                #全部data訓練10次
-                 #learning rate
-DOWNLOAD_MNIST = False    #第一次用要先下載data,所以是True
 
-for epoch in range(EPOCH):
-    for step, (x, y) in enumerate(train_loader):
-        b_x = Variable(x, requires_grad=False)
-        b_y = Variable(y, requires_grad=False)
-#決定跑幾個epoch,enumerate把load進來的data列出來成（x,y）
+#%% Continued Training from Checkpoints
 
-        if if_use_gpu:
-            b_x = b_x.cuda()
-            b_y = b_y.cuda()
-#使用cuda加速        
-        output = model(b_x)          #把data丟進網路中
-        loss = loss_function(output, b_y)
-        optimizer.zero_grad()      #計算loss,初始梯度
-        loss.backward()            #反向傳播
-        optimizer.step()       
+continued_network = Net()
+continued_optimizer = optim.SGD(network.parameters(), lr=learning_rate,momentum=momentum)
 
-        if step % 100 == 0:
-            print('Epoch:', epoch, '|step:', step, '|train loss:%.4f'%loss.data)
-        
-        #每100steps輸出一次train loss
-        
-        
-#%%
+network_state_dict = torch.load('./results/model.pth')
+continued_network.load_state_dict(network_state_dict)
 
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from torch.utils.data import DataLoader,Dataset
-from PIL import Image
-import matplotlib.pyplot as plt
-import numpy as np
+optimizer_state_dict = torch.load('./results/optimizer.pth')
+continued_optimizer.load_state_dict(optimizer_state_dict)
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-def pre_image(image_path,model):
-   img = Image.open(image_path)
-   mean = [0.485, 0.456, 0.406] 
-   std = [0.229, 0.224, 0.225]
-   transform_norm = transforms.Compose([transforms.ToTensor(), 
-   transforms.Resize((224,224)),transforms.Normalize(mean, std)])
-   # get normalized image
-   img_normalized = transform_norm(img).float()
-   img_normalized = img_normalized.unsqueeze_(0)
-   # input = Variable(image_tensor)
-   img_normalized = img_normalized.to(device)
-   # print(img_normalized.shape)
-   with torch.no_grad():
-      model.eval()  
-      output =model(img_normalized)
-     # print(output)
-      index = output.data.cpu().numpy().argmax()
-      classes = train_loader.dataset.classes
-      class_name = classes[index]
-      return class_name
-
+for i in range(4,9):
+  test_counter.append(i*len(train_loader.dataset))
+  train(i)
+  test()
+  
+fig = plt.figure()
+plt.plot(train_counter, train_losses, color='blue')
+plt.scatter(test_counter, test_losses, color='red')
+plt.legend(['Train Loss', 'Test Loss'], loc='upper right')
+plt.xlabel('number of training examples seen')
+plt.ylabel('negative log likelihood loss')
